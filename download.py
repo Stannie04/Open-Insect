@@ -5,7 +5,8 @@ from datasets import load_dataset
 import torch
 from torchvision import transforms
 import argparse
-
+from tqdm import tqdm
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 def get_resize_transform(resize_min_size):
     return transforms.Compose(
@@ -28,6 +29,29 @@ def resize_image(fpath, resize_size, log, current_index):
     image.save(fpath)
 
     return 1
+
+
+def download_one(session, url, fpath):
+    os.makedirs(os.path.dirname(fpath), exist_ok=True)
+
+    if os.path.exists(fpath):
+        return True, None
+
+    try:
+        response = session.get(url, timeout=20, stream=True)
+        response.raise_for_status()
+
+        tmp_path = fpath + ".tmp"
+        with open(tmp_path, "wb") as f:
+            for chunk in response.iter_content(1024 * 256):
+                if chunk:
+                    f.write(chunk)
+
+        os.replace(tmp_path, fpath)
+        return True, None
+
+    except Exception as e:
+        return False, str(e)
 
 
 def download_images_from_metadata(
@@ -81,33 +105,36 @@ def download_images_from_metadata(
             range(latest_downloaded_index, len(hf_dataset_split))
         )
 
-        for i, row in enumerate(subset, start=latest_downloaded_index):
-            url = row["identifier"]
-            fpath = row["image_path"]
-            fpath = os.path.join(image_dir, fpath)
-            os.makedirs(os.path.dirname(fpath), exist_ok=True)
+        session = requests.Session()
+        max_workers = 16
+        futures = []
 
-            if not os.path.exists(fpath):
-                try:
-                    response = requests.get(url, timeout=20)
-                    with open(fpath, "wb") as img:
-                        img.write(response.content)
-                except Exception as e:
-                    log.write(f"Error downloading {url}: {e}")
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            for i, row in enumerate(subset, start=latest_downloaded_index):
+                url = row["identifier"]
+                fpath = os.path.join(image_dir, row["image_path"])
+
+                future = executor.submit(download_one, session, url, fpath)
+                futures.append((i, row, fpath, future))
+
+            for i, row, fpath, future in tqdm(futures):
+                success, error = future.result()
+
+                if not success:
+                    log.write(f"{i} Error downloading {row['identifier']}: {error}\n")
                     log.flush()
                     continue
 
-            if resize_size:
-                if not resize_image(fpath, resize_size, log, i):
-                    continue
+                # resize AFTER download completes
+                if resize_size:
+                    if not resize_image(fpath, resize_size, log, i):
+                        continue
 
-            metadata.write(
-                f"{row['image_path']} {row['label']}\n"
-            )  # only include the image in the metadata if we successfull resize it
-            metadata.flush()
-            log.write(f"{i}\n")
-            log.flush()
-            print(i)
+                metadata.write(f"{row['image_path']} {row['label']}\n")
+                metadata.flush()
+
+                log.write(f"{i}\n")
+                log.flush()
 
         print("Download finished", flush=True)
 
